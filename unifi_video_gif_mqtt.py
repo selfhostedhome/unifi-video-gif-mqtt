@@ -6,7 +6,12 @@ import subprocess
 import os
 from collections import namedtuple
 from pathlib import Path
+import time
 from tempfile import mkstemp
+from collections import deque
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 
 def load_metadata(metadata_file):
@@ -67,31 +72,82 @@ def combine_video_files(video_clips):
 def convert_video_gif(input_video, output_gif):
     subprocess.call([
         "ffmpeg", "-i", input_video, "-vf",
-        "fps=15,scale=320:-1:flags=lanczos", "-y", output_gif
+        "fps=15,scale=320:-1:flags=lanczos", "-y",
+        str(output_gif)
     ])
-    print(output_gif)
+    os.remove(input_video)
+
+
+def parse_config(config_path):
+    with open(config_path, 'r') as config_file:
+        config_data = json.load(config_file)
+    return config_data
+
+
+class UniFiVideoEventHandler(FileSystemEventHandler):
+    def __init__(self, config):
+        self.config = config
+
+        # Keep a FIFO of files processed so we can guard against duplicate
+        # filesystem events
+        self.processed_files = deque(maxlen=20)
+        super().__init__()
+
+    def on_any_event(self, event):
+        print(event)
+
+    def on_modified(self, event):
+        modified_file = Path(event.src_path)
+        if modified_file.suffix == ".json" and modified_file.parent.name == "meta":
+            self.convert_gif(modified_file)
+
+    def convert_gif(self, metadata_file):
+        output_gif = Path(
+            self.config["gif_output_dir"]).joinpath(metadata_file.stem +
+                                                    '.gif')
+
+        # Make sure we didn't get a duplicate filesystem event and process
+        # something we already processed
+        if output_gif in self.processed_files:
+            return
+
+        metadata = load_metadata(metadata_file)
+        metadata = parse_metadata(metadata)
+
+        if metadata is None:
+            return
+
+        video_dir = metadata_file.parent.parent
+        video_files = choose_video_files(video_dir, metadata.start,
+                                         metadata.end)
+
+        # Each video is 2 seconds long, so take 7 of them to make 14 second gif
+        if len(video_files) > 7:
+            video_files = video_files[:7]
+
+        video_file = combine_video_files(video_files)
+        convert_video_gif(video_file, output_gif)
+
+        # Add to list of processed files
+        self.processed_files.append(output_gif)
 
 
 def main():
-    _, new_meta_file = sys.argv
-    new_meta_file = Path(new_meta_file)
+    _, config_filename = sys.argv
+    config = parse_config(config_filename)
 
-    metadata = load_metadata(new_meta_file)
-    metadata = parse_metadata(metadata)
+    event_handler = UniFiVideoEventHandler(config)
+    observer = Observer()
+    observer.schedule(
+        event_handler, config["unifi_video_watch_dir"], recursive=True)
+    observer.start()
 
-    if metadata is None:
-        sys.exit(1)
-
-    video_dir = new_meta_file.parent.parent
-    video_files = choose_video_files(video_dir, metadata.start, metadata.end)
-
-    # Each video is 2 seconds long, so take 7 of them to make 14 second gif
-    if len(video_files) > 7:
-        video_files = video_files[:7]
-
-    output_gif = new_meta_file.stem + '.gif'
-    video_file = combine_video_files(video_files)
-    convert_video_gif(video_file, output_gif)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
 
 
 if __name__ == "__main__":
