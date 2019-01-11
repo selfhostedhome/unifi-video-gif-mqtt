@@ -12,6 +12,7 @@ from collections import deque
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import paho.mqtt.client as mqtt
 
 
 def load_metadata(metadata_file):
@@ -88,6 +89,8 @@ class UniFiVideoEventHandler(FileSystemEventHandler):
     def __init__(self, config):
         self.config = config
 
+        self.mqtt_client = mqtt.Client()
+
         # Keep a FIFO of files processed so we can guard against duplicate
         # filesystem events
         self.processed_files = deque(maxlen=20)
@@ -99,7 +102,9 @@ class UniFiVideoEventHandler(FileSystemEventHandler):
     def on_modified(self, event):
         modified_file = Path(event.src_path)
         if modified_file.suffix == ".json" and modified_file.parent.name == "meta":
-            self.convert_gif(modified_file)
+            gif, camera_name = self.convert_gif(modified_file)
+            if gif:
+                self.publish_mqtt_message(gif, camera_name)
 
     def convert_gif(self, metadata_file):
         output_gif = Path(
@@ -109,13 +114,13 @@ class UniFiVideoEventHandler(FileSystemEventHandler):
         # Make sure we didn't get a duplicate filesystem event and process
         # something we already processed
         if output_gif in self.processed_files:
-            return
+            return None, None
 
         metadata = load_metadata(metadata_file)
         metadata = parse_metadata(metadata)
 
         if metadata is None:
-            return
+            return None, None
 
         video_dir = metadata_file.parent.parent
         video_files = choose_video_files(video_dir, metadata.start,
@@ -130,6 +135,14 @@ class UniFiVideoEventHandler(FileSystemEventHandler):
 
         # Add to list of processed files
         self.processed_files.append(output_gif)
+
+        return output_gif, metadata.name
+
+    def publish_mqtt_message(self, gif, camera_name):
+        self.mqtt_client.connect(self.config["mqtt_server"],
+                                 self.config["mqtt_port"])
+        ret = self.mqtt_client.publish(
+            self.config["mqtt_base_topic"] + "/" + camera_name, gif.name)
 
 
 def main():
